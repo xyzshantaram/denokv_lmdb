@@ -61,25 +61,20 @@ impl<'a> BytesEncode<'a> for LmdbDKvValue {
     type EItem = LmdbDKvValue;
 
     fn bytes_encode(item: &Self::EItem) -> Result<Cow<[u8]>, Box<dyn std::error::Error>> {
-        let v = match &item.0 {
-            KvValue::V8(val) => {
-                let mut res = vec![2u8];
-                res.extend(val);
-                res
-            }
-            KvValue::Bytes(val) => {
-                let mut res = vec![1u8];
-                res.extend(val);
-                res
-            }
-            KvValue::U64(val) => {
-                let mut res = vec![0u8];
-                res.extend(val.to_le_bytes());
-                res
-            }
+        let mut res = vec![match &item.0 {
+            KvValue::V8(_) => 2u8,
+            KvValue::Bytes(_) => 1u8,
+            _ => 0u8,
+        }];
+
+        let contents = match &item.0 {
+            KvValue::V8(val) | KvValue::Bytes(val) => val.to_owned(),
+            KvValue::U64(val) => val.to_le_bytes().to_vec(),
         };
 
-        Ok(Cow::Owned(v.clone()))
+        res.extend(contents);
+
+        Ok(Cow::Owned(res))
     }
 }
 
@@ -117,26 +112,37 @@ impl denokv_proto::Database for LmdbDatabase {
         let mut res = Vec::<ReadRangeOutput>::new();
         let txn = self.env.read_txn().map_err(|e| Error::msg(e.to_string()))?;
         for req in requests {
-            let mut oup = ReadRangeOutput {
-                entries: Vec::<KvEntry>::new(),
-            };
-
             let start_key = LmdbDKvKey(req.start);
             let end_key = LmdbDKvKey(req.end);
-            for result in (self
-                .db
-                .range(&txn, &(&start_key..&end_key))
-                .map_err(|e| Error::msg(e.to_string()))?)
-            .flatten()
-            {
-                oup.entries.push(KvEntry {
-                    key: result.0 .0,
-                    value: result.1 .0,
-                    versionstamp: [0; 10],
-                })
-            }
+            let range = &(&start_key..&end_key);
 
-            res.push(oup);
+            let results: Box<dyn Iterator<Item = (LmdbDKvKey, LmdbDKvValue)>> = if req.reverse {
+                Box::new(
+                    (self
+                        .db
+                        .rev_range(&txn, range)
+                        .map_err(|e| Error::msg(e.to_string()))?)
+                    .flatten(),
+                )
+            } else {
+                Box::new(
+                    (self
+                        .db
+                        .range(&txn, range)
+                        .map_err(|e| Error::msg(e.to_string()))?)
+                    .flatten(),
+                )
+            };
+
+            res.push(ReadRangeOutput {
+                entries: results
+                    .map(|(k, v)| KvEntry {
+                        key: k.0,
+                        value: v.0,
+                        versionstamp: [0; 10],
+                    })
+                    .collect(),
+            });
         }
 
         Ok(res)
